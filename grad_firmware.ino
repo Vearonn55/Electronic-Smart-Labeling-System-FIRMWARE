@@ -1,0 +1,528 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <HardwareSerial.h>
+#include "esp_wifi.h"  // Required to set MAC address
+#include "freertos/semphr.h"
+SemaphoreHandle_t displayMutex;
+
+const uint8_t FONT_5x7[][7] = {                                    // CHARSET
+  // 0
+  {0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110},
+  // 1
+  {0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110},
+  // 2
+  {0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111},
+  // 3
+  {0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110},
+  // 4
+  {0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010},
+  // 5
+  {0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110},
+  // 6
+  {0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110},
+  // 7
+  {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000},
+  // 8
+  {0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110},
+  // 9
+  {0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100},
+  // T
+  {0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100},
+  // L
+  {0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111},
+  // .
+  {0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00100, 0b00100}
+};
+
+
+
+const char* ssid = "DONMEZOGLU";              // WIFI ADRESS
+const char* password = "Dnmz753159!";                      // PASSWORD
+const char* host = "http://192.168.10.209:5050";        // CHANGE THE IP ADRESS http://xxx.xxx.xxx.xx:5050.  (x is placeholder).
+const char* loginUser = "admin";
+const char* loginPass = "admin123";
+String jwtToken = "";
+
+int currentProductID = -1;
+int currentStock = -1;
+String currentName = "";
+String currentPrice = "";
+String currentExpiry = "";
+
+#define RST_PIN 5
+#define WAKE_PIN 18
+#define RX_PIN 16
+#define TX_PIN 17
+
+HardwareSerial epaper(2);
+
+uint8_t fixedMAC[6] = { 0xC8, 0xF0, 0x9E, 0x4C, 0xE3, 0x60 };
+
+volatile bool isRenderingPrice = false;
+volatile bool priceRenderComplete = false;
+volatile bool labelRenderComplete = false;
+
+// ==== Function Declarations ====
+
+void drawBigPrice(String priceStr, int x, int y, int scale = 6);
+void drawPriceTask(void *parameter);
+void sendCommand(uint8_t cmd, uint8_t* data, uint16_t dataLen);
+void clearScreen();
+void refreshScreen();
+void setColors(uint8_t fg, uint8_t bg);
+void displayText(uint16_t x, uint16_t y, const String& text);
+void drawLine(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2);
+void drawThickRect(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint8_t t);
+void drawLoadLine(int lineIndex, const String& status, int, int);
+void drawBottomProgressBar(int filled, int total);
+void drawSystemStatsFooter();
+bool handshake();
+bool loginAndFetchToken();
+bool fetchProductData(int productId, String &name, String &price, int &stock, String &expiry);
+void drawCharBlock(char ch, int x, int y, int scale);
+void fillRect(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2);
+void drawProductLabel(String name, String unit, String price, String stock, String expiry, int productId, bool skipPrice = false);
+bool checkAndUpdateDisplay();
+void drawLabelTask(void* parameter);
+
+void drawPriceTask(void *parameter) {
+  if (isRenderingPrice) {
+    vTaskDelete(NULL);
+    return;
+  }
+
+  isRenderingPrice = true;
+
+  String priceStr = *((String *)parameter);
+  delete (String *)parameter;
+
+  // Debugging check
+  if (priceStr.length() == 0 || priceStr.indexOf('T') == -1) {
+    Serial.println("⚠️ Invalid price string: " + priceStr);
+  }
+  drawBigPrice(priceStr, 250, 370, 5);
+
+  priceRenderComplete = true;
+  isRenderingPrice = false;
+  vTaskDelete(NULL);
+}
+
+void drawLabelTask(void* parameter) {
+  String* args = (String*)parameter;
+
+  drawProductLabel(args[0], args[1], args[2], args[3], args[4], args[5].toInt(), true);
+  delete[] args;
+
+  labelRenderComplete = true;  //Signal ready to flush
+
+  vTaskDelete(NULL);
+}
+
+void sendCommand(uint8_t cmd, uint8_t* data, uint16_t dataLen) {
+  if (xSemaphoreTake(displayMutex, portMAX_DELAY) == pdTRUE) {
+    uint16_t totalLen = 9 + dataLen;
+    uint8_t frame[totalLen];
+    uint16_t index = 0;
+    frame[index++] = 0xA5;
+    frame[index++] = (totalLen >> 8) & 0xFF;
+    frame[index++] = totalLen & 0xFF;
+    frame[index++] = cmd;
+    for (int i = 0; i < dataLen; i++) frame[index++] = data[i];
+    frame[index++] = 0xCC; frame[index++] = 0x33; frame[index++] = 0xC3; frame[index++] = 0x3C;
+    uint8_t parity = 0;
+    for (int i = 0; i < totalLen - 1; i++) parity ^= frame[i];
+    frame[index++] = parity;
+
+    epaper.write(frame, totalLen);
+    epaper.flush();
+    delayMicroseconds(100); // safe margin
+
+    xSemaphoreGive(displayMutex);
+  }
+}
+
+void clearScreen() {
+  sendCommand(0x2E, nullptr, 0);
+  delay(300);
+}
+
+void refreshScreen() {
+  sendCommand(0x0A, nullptr, 0);
+  delay(1000);
+}
+
+void setColors(uint8_t fg, uint8_t bg) {
+  uint8_t colorData[2] = {fg, bg};
+  sendCommand(0x10, colorData, 2);
+  delay(50);
+}
+
+void displayText(uint16_t x, uint16_t y, const String& text) {
+  setColors(0x00, 0x03);
+  uint16_t dataLen = 4 + text.length() + 1;
+  uint8_t data[dataLen];
+  uint16_t i = 0;
+  data[i++] = (x >> 8) & 0xFF;
+  data[i++] = x & 0xFF;
+  data[i++] = (y >> 8) & 0xFF;
+  data[i++] = y & 0xFF;
+  for (int j = 0; j < text.length(); j++) data[i++] = text[j];
+  data[i++] = 0x00;
+  sendCommand(0x30, data, dataLen);
+  delay(50);
+}
+
+void drawLine(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
+  uint8_t data[8] = {
+    (x1 >> 8) & 0xFF, x1 & 0xFF,
+    (y1 >> 8) & 0xFF, y1 & 0xFF,
+    (x2 >> 8) & 0xFF, x2 & 0xFF,
+    (y2 >> 8) & 0xFF, y2 & 0xFF
+  };
+  sendCommand(0x22, data, 8);
+  delay(5);
+}
+
+void drawThickRect(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint8_t t) {
+  for (uint8_t i = 0; i < t; i++) {
+    drawLine(x1 + i, y1 + i, x2 - i, y1 + i);
+    drawLine(x1 + i, y2 - i, x2 - i, y2 - i);
+    drawLine(x1 + i, y1 + i, x1 + i, y2 - i);
+    drawLine(x2 - i, y1 + i, x2 - i, y2 - i);
+  }
+}
+
+void drawLoadLine(int lineIndex, const String& status, int, int) {
+  displayText(40, 40 + lineIndex * 28, status);
+  refreshScreen();
+  delay(200);  // Optional: adjust for pacing
+}
+
+void drawBottomProgressBar(int filled, int total) {
+  int startX = 60, endX = 740, y = 430;
+  int barWidth = endX - startX;
+  int filledWidth = (barWidth * filled) / total;
+
+  setColors(0x00, 0x03);
+  for (int i = 0; i <= 10; i++) {
+    drawLine(startX, y + i, startX + filledWidth, y + i);
+  }
+
+  setColors(0x03, 0x03);
+  drawThickRect(startX, y, endX, y + 10, 1);
+
+  displayText(startX, 380, "Initializing...");
+}
+
+void drawSystemStatsFooter() {
+  String heap = "Heap: " + String(ESP.getFreeHeap()) + " B";
+  String cpu = "CPU: " + String(getCpuFrequencyMhz()) + "MHz";
+  displayText(40, 460, heap);
+  displayText(600, 460, cpu);
+  refreshScreen();
+}
+
+bool handshake() {
+  uint8_t cmd[] = {0xA5, 0x00, 0x09, 0x00, 0xCC, 0x33, 0xC3, 0x3C, 0xAC};
+  epaper.write(cmd, sizeof(cmd));
+  epaper.flush();
+  unsigned long timeout = millis() + 2000;
+  while (millis() < timeout) {
+    if (epaper.available() && epaper.read() == 'O') return true;
+    delay(10);
+  }
+  return false;
+}
+
+bool loginAndFetchToken() {
+  HTTPClient http;
+  http.begin(String(host) + "/api/auth/login");
+  http.addHeader("Content-Type", "application/json");
+
+  String body = "{\"UserName\":\"" + String(loginUser) + "\",\"Password\":\"" + String(loginPass) + "\"}";
+  int code = http.POST(body);
+
+  Serial.println("Login HTTP Code: " + String(code));
+  Serial.println("Login Response: " + http.getString());
+
+  if (code != 200) return false;
+
+  JsonDocument doc;
+  deserializeJson(doc, http.getString());
+  jwtToken = "Bearer " + String((const char*)doc["token"]);
+  return true;
+}
+
+bool fetchProductData(int productId, String &name, String &price, int &stock, String &expiry) {
+  HTTPClient http;
+  http.begin(String(host) + "/api/products/" + productId);
+  http.addHeader("Authorization", jwtToken);
+  int code = http.GET();
+  if (code != 200) return false;
+  JsonDocument doc;
+  deserializeJson(doc, http.getString());
+  name = doc["Name"] | "Unknown";
+  float val = String((const char*)doc["Price"]).toFloat();
+  price = String(val, 2);
+  stock = doc["StockQuantity"] | 0;
+  expiry = String((const char*)doc["ExpiryDate"]);
+  expiry = expiry.substring(0, 10);
+  expiry.replace("-", ".");
+  return true;
+}
+
+void drawCharBlock(char ch, int x, int y, int scale) {
+  int index = -1;
+  if (ch >= '0' && ch <= '9') index = ch - '0';
+  else if (ch == 'T') index = 10;
+  else if (ch == 'L') index = 11;
+  else if (ch == '.') index = 12;
+  else return;
+
+  setColors(0x00, 0x03); // black foreground, white background
+
+  for (int row = 0; row < 7; row++) {
+    uint8_t line = FONT_5x7[index][row];
+    int startCol = -1;
+
+    for (int col = 0; col < 5; col++) {
+      bool pixelOn = (line >> (4 - col)) & 1;
+
+      if (pixelOn && startCol == -1) {
+        startCol = col;
+      }
+
+      if ((!pixelOn || col == 4) && startCol != -1) {
+        int endCol = pixelOn ? col : col - 1;
+
+        int x0 = x + startCol * scale;
+        int x1 = x + endCol * scale + (scale - 1);
+
+        for (int dy = 0; dy < scale; dy++) {
+          drawLine(x0, y + row * scale + dy, x1, y + row * scale + dy);
+        }
+
+        startCol = -1;
+      }
+    }
+  }
+}
+
+void fillRect(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2) {
+  setColors(0x03, 0x03); // White foreground, white background (to clear)
+  for (uint16_t y = y1; y <= y2; y++) {
+    drawLine(x1, y, x2, y);
+  }
+}
+
+void drawBigPrice(String priceStr, int x, int y, int scale) {
+  int spacing = scale * 2; // Increased spacing to prevent overlap
+
+  for (int i = 0; i < priceStr.length(); i++) {
+    char ch = priceStr[i];
+    drawCharBlock(ch, x + i * (5 * scale + spacing), y, scale);
+  }
+}
+
+void drawProductLabel(String name, String unit, String price, String stock, String expiry, int productId, bool skipPrice) {
+  if (!skipPrice) clearScreen(); // Only clear screen if we will draw everything including price
+
+  // Frame + top section
+  drawThickRect(40, 100, 760, 460, 12); // outer
+  drawThickRect(60, 120, 740, 170, 5);  // top bar
+  setColors(0x03, 0x00);
+  displayText(100, 135, name + "    " + unit);
+
+  // QR + Info
+  setColors(0x00, 0x03);
+  drawThickRect(60, 190, 210, 340, 5);    // QR box
+  displayText(65, 230, "[QR CODE]");
+
+  drawThickRect(240, 190, 740, 340, 5);   // info box
+  displayText(260, 230, "Product ID: " + String(productId));
+  displayText(260, 290, "EXP: " + expiry);
+
+  // Bottom labels
+  displayText(100, 360, "Retail Price:");
+  displayText(600, 360, "Stock: " + stock);
+
+  if (!skipPrice) {
+    drawBigPrice(price + "TL", 250, 370, 6);
+  }
+}
+
+bool checkAndUpdateDisplay() {
+  String mac = WiFi.macAddress();
+  mac.replace(":", "-");
+  Serial.println("Checking for ESL with MAC: " + mac);
+
+  HTTPClient http;
+  http.begin(String(host) + "/api/esltag/mac/" + mac);
+  int code = http.GET();
+  Serial.println("ESLTag GET Status: " + String(code));
+
+  if (code != 200) {
+    Serial.println("Failed to get ESL tag");
+    return false;
+  }
+
+  String response = http.getString();
+  Serial.println("ESLTag Response: " + response);
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, response);
+  if (err || !doc["ProductID"].is<int>()) {
+    Serial.println("Invalid ESL tag or missing ProductID");
+    return false;
+  }
+
+  int pid = doc["ProductID"];
+  Serial.println("Linked Product ID: " + String(pid));
+
+  String name, price, expiry;
+  int stock;
+  if (!fetchProductData(pid, name, price, stock, expiry)) {
+    Serial.println("Failed to fetch product data");
+    return false;
+  }
+
+  Serial.println("Product fetched:");
+  Serial.println("Name: " + name);
+  Serial.println("Price: " + price);
+  Serial.println("Stock: " + String(stock));
+  Serial.println("Expiry: " + expiry);
+
+  bool changed = pid != currentProductID || name != currentName || price != currentPrice
+                 || stock != currentStock || expiry != currentExpiry;
+
+  if (!changed) return true;
+
+  currentProductID = pid;
+  currentName = name;
+  currentPrice = price;
+  currentStock = stock;
+  currentExpiry = expiry;
+
+  // ✅ Reset flags and clear screen once before new content
+  labelRenderComplete = false;
+  priceRenderComplete = false;
+  clearScreen();  // Very important: full wipe before drawing
+
+  // 🔁 Start label drawing thread
+  String* args = new String[6]{name, "1 pc", price, String(stock), expiry, String(pid)};
+  xTaskCreatePinnedToCore(
+    drawLabelTask,
+    "LabelTask",
+    8192,
+    args,
+    1,
+    NULL,
+    0
+  );
+
+  // ⏱ Small delay before price starts (so label gets ahead)
+  delay(450);
+
+  if (!isRenderingPrice) {
+    String* priceCopy = new String(price + "TL");
+    xTaskCreatePinnedToCore(
+      drawPriceTask,
+      "PriceRenderer",
+      8192,
+      priceCopy,
+      1,
+      NULL,
+      0
+    );
+  }
+
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  epaper.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
+  displayMutex = xSemaphoreCreateMutex();
+
+  pinMode(RST_PIN, OUTPUT);
+  pinMode(WAKE_PIN, OUTPUT);
+  digitalWrite(WAKE_PIN, LOW);
+  digitalWrite(RST_PIN, LOW);
+  delay(100);
+  digitalWrite(WAKE_PIN, HIGH);
+  delay(100);
+  digitalWrite(RST_PIN, HIGH);
+  delay(1000);
+  refreshScreen();
+  clearScreen();
+
+  esp_wifi_set_mac(WIFI_IF_STA, fixedMAC);
+  Serial.println("ESP32 IP: " + WiFi.localIP().toString()); // serial log
+
+  int line = 0, steps = 6, done = 0;
+
+  displayText(40, 10, "MAC: Initializing...");
+  drawSystemStatsFooter();
+  delay(200);
+  refreshScreen();
+
+  if (!handshake()) {
+    drawLoadLine(line++, "EPD Handshake Failed", 2, 10);
+    return;
+  }
+  drawLoadLine(line++, "EPD Ready", 3, 10);
+  drawBottomProgressBar(++done, steps);
+
+  drawLoadLine(line++, "Connecting WiFi...", 0, 10);
+  WiFi.begin(ssid, password);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) delay(500);
+  if (WiFi.status() != WL_CONNECTED) {
+    drawLoadLine(line++, "WiFi Failed", 4, 10);
+    return;
+  }
+  drawLoadLine(line++, "WiFi Connected", 6, 10);
+  drawBottomProgressBar(++done, steps);
+
+  String mac = WiFi.macAddress();
+  mac.replace(":", "-");
+  displayText(40, 10, "MAC: " + mac); // Overwrites the placeholder
+  refreshScreen();
+
+
+  drawLoadLine(line++, "Logging In...", 0, 10);
+  if (!loginAndFetchToken()) {
+    drawLoadLine(line++, "Login Failed", 6, 10);
+    return;
+  }
+  drawLoadLine(line++, "Login Successful", 8, 10);
+  drawBottomProgressBar(++done, steps);
+  delay(200);
+
+  drawLoadLine(line++, "Fetching Product Info...", 0, 10);
+  drawBottomProgressBar(++done, steps);
+  drawSystemStatsFooter();
+  delay(50);
+
+  checkAndUpdateDisplay();
+  delay(400);
+  refreshScreen();
+}
+
+void loop() {
+  static unsigned long lastCheck = 0;
+  static bool flushed = false;
+
+  if (millis() - lastCheck > 10000) {
+    lastCheck = millis();
+    flushed = false;
+    checkAndUpdateDisplay();
+  }
+
+  if (labelRenderComplete && priceRenderComplete && !flushed) {
+    refreshScreen();
+    flushed = true;
+    labelRenderComplete = false;
+    priceRenderComplete = false;
+  }
+}
